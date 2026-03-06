@@ -1,0 +1,27 @@
+replicaCount: 1
+
+image:
+  repository: dapr-repro
+  tag: latest
+  pullPolicy: IfNotPresent
+
+dapr:
+  appId: dapr-repro
+  appPort: "8080"
+  pubsubName: pubsub
+  incomingTopic: incoming-events
+  completionTopic: completed-events
+  # blockShutdownDuration keeps the Dapr sidecar fully alive (accepting API calls from
+  # the app) for this duration after SIGTERM. With native sidecars this is belt-and-
+  # suspenders — K8s already guarantees the sidecar outlives the app container — but
+  # it is kept as an extra safety margin.
+  blockShutdownDuration: "60s"
+  # gracefulShutdownSeconds is the time Dapr allows itself to finish in-flight
+  # operations after block-shutdown-duration has elapsed.
+  gracefulShutdownSeconds: "90"
+
+rabbit:
+  host: rabbitmq.rabbit.svc.cluster.local
+  port: "5672"
+  username: rabbit
+  password: rabbit

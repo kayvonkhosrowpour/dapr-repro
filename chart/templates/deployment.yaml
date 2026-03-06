@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dapr-repro
+  labels:
+    app: dapr-repro
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: dapr-repro
+  template:
+    metadata:
+      labels:
+        app: dapr-repro
+      annotations:
+        # ── Dapr sidecar injection ────────────────────────────────────────────
+        dapr.io/enabled: "true"
+
+        # Native sidecar (K8s 1.28+ KEP-753): injects daprd as an init container
+        # with restartPolicy:Always, giving two hard lifecycle guarantees:
+        #   1. Startup:  daprd is Ready before the app container starts — no race.
+        #   2. Shutdown: K8s terminates the app container first; the sidecar only
+        #                receives SIGTERM after the app has exited, so Dapr is
+        #                guaranteed to be alive for the entire drain + publish phase.
+        dapr.io/enable-native-sidecar: "true"
+
+        dapr.io/app-id: {{ .Values.dapr.appId | quote }}
+        dapr.io/app-port: {{ .Values.dapr.appPort | quote }}
+
+        # ── App health checks ────────────────────────────────────────────────
+        # Dapr polls /healthz every 3 seconds. When the app sets itself to
+        # unhealthy on SIGTERM, Dapr detects it within ~6 s (2 consecutive
+        # failures) and stops routing new pub/sub events to this app.
+        dapr.io/enable-app-health-check: "true"
+        dapr.io/app-health-check-path: "/healthz"
+        dapr.io/app-health-probe-interval: "3"
+        dapr.io/app-health-threshold: "2"
+
+        # ── Graceful shutdown ────────────────────────────────────────────────
+        # block-shutdown-duration: Dapr sidecar delays starting its own shutdown
+        # procedure for this duration after receiving SIGTERM, keeping the Dapr
+        # APIs (e.g. publish) available to the app throughout its drain sequence.
+        dapr.io/block-shutdown-duration: {{ .Values.dapr.blockShutdownDuration | quote }}
+        # graceful-shutdown-seconds: once block-shutdown-duration has elapsed,
+        # Dapr has this many seconds to flush any remaining in-flight operations.
+        dapr.io/graceful-shutdown-seconds: {{ .Values.dapr.gracefulShutdownSeconds | quote }}
+    spec:
+      # terminationGracePeriodSeconds must exceed the total expected shutdown time:
+      #   10s (health probe wait) + 20s (event handler) + 60s (block-shutdown) + buffer
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: dapr-repro
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PUBSUB_NAME
+              value: {{ .Values.dapr.pubsubName | quote }}
+            - name: COMPLETION_TOPIC
+              value: {{ .Values.dapr.completionTopic | quote }}
+            - name: DAPR_HTTP_PORT
+              value: "3500"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
