@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -63,7 +64,7 @@ func main() {
 	r.Use(middleware.Recoverer)
 
 	r.Get("/healthz", app.healthHandler)
-	r.Post("/events/incoming", app.handleIncomingEvent)
+	r.Post("/sqs-incoming", app.handleSQSBinding)
 
 	server := &http.Server{
 		Addr:    ":8080",
@@ -131,10 +132,25 @@ func (a *App) healthHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, `{"status":"healthy"}`)
 }
 
-func (a *App) handleIncomingEvent(w http.ResponseWriter, r *http.Request) {
-	a.logger.Info("event received — beginning processing",
-		zap.String("method", r.Method),
-		zap.String("path", r.URL.Path),
+func (a *App) handleSQSBinding(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		a.logger.Error("failed to read request body", zap.Error(err))
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+
+	var payload map[string]any
+	eventID := "unknown"
+	if err := json.Unmarshal(body, &payload); err == nil {
+		if id, ok := payload["id"]; ok {
+			eventID = fmt.Sprintf("%v", id)
+		}
+	}
+
+	a.logger.Info("SQS binding event received — beginning processing",
+		zap.String("event_id", eventID),
+		zap.String("body", string(body)),
 		zap.String("remote_addr", r.RemoteAddr),
 	)
 
@@ -146,37 +162,39 @@ func (a *App) handleIncomingEvent(w http.ResponseWriter, r *http.Request) {
 		<-ticker.C
 		elapsed++
 		a.logger.Info("event processing tick",
+			zap.String("event_id", eventID),
 			zap.Int("second", elapsed),
 			zap.Int("total", int(processingDuration.Seconds())),
 		)
 	}
 
 	a.logger.Info("event processing complete — publishing completion event",
+		zap.String("event_id", eventID),
 		zap.String("pubsub", a.pubsubName),
 		zap.String("topic", a.completionTopic),
 	)
 
 	if err := a.publishCompletion(r.Context()); err != nil {
-		a.logger.Error("publish failed — returning RETRY",
+		a.logger.Error("publish failed — returning 500 (message stays in SQS)",
 			zap.Error(err),
+			zap.String("event_id", eventID),
 			zap.String("pubsub", a.pubsubName),
 			zap.String("topic", a.completionTopic),
 		)
-		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"status": "RETRY"}) //nolint:errcheck
 		return
 	}
 
 	a.logger.Info("completion event published successfully",
+		zap.String("event_id", eventID),
 		zap.String("pubsub", a.pubsubName),
 		zap.String("topic", a.completionTopic),
 	)
 
-	a.logger.Info("handler returning SUCCESS")
-	w.Header().Set("Content-Type", "application/json")
+	a.logger.Info("handler returning 200 — Dapr will delete message from SQS",
+		zap.String("event_id", eventID),
+	)
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "SUCCESS"}) //nolint:errcheck
 }
 
 func (a *App) publishCompletion(ctx context.Context) error {

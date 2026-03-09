@@ -27,6 +27,8 @@ spec:
 
         dapr.io/app-id: {{ .Values.dapr.appId | quote }}
         dapr.io/app-port: {{ .Values.dapr.appPort | quote }}
+        dapr.io/log-level: "debug"
+        dapr.io/log-as-json: "true"
 
         # ── App health checks ────────────────────────────────────────────────
         # Dapr polls /healthz every 3 seconds. When the app sets itself to
