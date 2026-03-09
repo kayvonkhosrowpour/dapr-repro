@@ -1,35 +1,32 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"go.uber.org/zap"
 )
 
 const (
-	processingDuration   = 20 * time.Second
-	healthProbeWait      = 10 * time.Second
+	processingDuration    = 20 * time.Second
 	serverShutdownTimeout = 60 * time.Second
+	consumerTag           = "dapr-repro"
 )
 
 type App struct {
-	healthy         atomic.Bool
-	logger          *zap.Logger
-	pubsubName      string
-	completionTopic string
-	daprBaseURL     string
+	healthy           atomic.Bool
+	logger            *zap.Logger
+	publishCh         *amqp.Channel
+	completionExchange string
 }
 
 func getEnv(key, fallback string) string {
@@ -46,112 +43,175 @@ func main() {
 	}
 	defer logger.Sync() //nolint:errcheck
 
+	rabbitURL := getEnv("RABBITMQ_URL", "amqp://rabbit:rabbit@rabbitmq.rabbit.svc.cluster.local:5672")
+	incomingExchange := getEnv("INCOMING_EXCHANGE", "incoming-events")
+	incomingQueue := getEnv("INCOMING_QUEUE", "dapr-repro-incoming-events")
+	completionExchange := getEnv("COMPLETION_EXCHANGE", "completed-events")
+
+	logger.Info("application starting",
+		zap.String("incoming_exchange", incomingExchange),
+		zap.String("incoming_queue", incomingQueue),
+		zap.String("completion_exchange", completionExchange),
+	)
+
+	// --- Connect to RabbitMQ ---
+	conn, err := amqp.Dial(rabbitURL)
+	if err != nil {
+		logger.Fatal("failed to connect to RabbitMQ", zap.Error(err))
+	}
+	defer conn.Close()
+
+	consumeCh, err := conn.Channel()
+	if err != nil {
+		logger.Fatal("failed to open consume channel", zap.Error(err))
+	}
+	defer consumeCh.Close()
+
+	if err := consumeCh.Qos(1, 0, false); err != nil {
+		logger.Fatal("failed to set QoS", zap.Error(err))
+	}
+
+	publishCh, err := conn.Channel()
+	if err != nil {
+		logger.Fatal("failed to open publish channel", zap.Error(err))
+	}
+	defer publishCh.Close()
+
+	// --- Declare infrastructure (idempotent) ---
+	dlxExchange := fmt.Sprintf("dlx-%s", incomingQueue)
+	dlqQueue := fmt.Sprintf("dlq-%s", incomingQueue)
+
+	if err := consumeCh.ExchangeDeclare(incomingExchange, "topic", true, false, false, false, nil); err != nil {
+		logger.Fatal("failed to declare incoming exchange", zap.Error(err), zap.String("exchange", incomingExchange))
+	}
+
+	if err := consumeCh.ExchangeDeclare(completionExchange, "topic", true, false, false, false, nil); err != nil {
+		logger.Fatal("failed to declare completion exchange", zap.Error(err), zap.String("exchange", completionExchange))
+	}
+
+	if err := consumeCh.ExchangeDeclare(dlxExchange, "fanout", true, false, false, false, nil); err != nil {
+		logger.Fatal("failed to declare DLX exchange", zap.Error(err), zap.String("exchange", dlxExchange))
+	}
+
+	_, err = consumeCh.QueueDeclare(dlqQueue, true, false, false, false, amqp.Table{
+		"x-queue-mode": "lazy",
+	})
+	if err != nil {
+		logger.Fatal("failed to declare DLQ queue", zap.Error(err), zap.String("queue", dlqQueue))
+	}
+
+	if err := consumeCh.QueueBind(dlqQueue, "#", dlxExchange, false, nil); err != nil {
+		logger.Fatal("failed to bind DLQ queue", zap.Error(err))
+	}
+
+	_, err = consumeCh.QueueDeclare(incomingQueue, true, false, false, false, amqp.Table{
+		"x-dead-letter-exchange": dlxExchange,
+	})
+	if err != nil {
+		logger.Fatal("failed to declare incoming queue", zap.Error(err), zap.String("queue", incomingQueue))
+	}
+
+	if err := consumeCh.QueueBind(incomingQueue, "#", incomingExchange, false, nil); err != nil {
+		logger.Fatal("failed to bind incoming queue", zap.Error(err))
+	}
+
+	logger.Info("RabbitMQ infrastructure declared",
+		zap.String("exchange", incomingExchange),
+		zap.String("queue", incomingQueue),
+		zap.String("completion_exchange", completionExchange),
+		zap.String("dlx_exchange", dlxExchange),
+		zap.String("dlq_queue", dlqQueue),
+	)
+
 	app := &App{
-		logger:          logger,
-		pubsubName:      getEnv("PUBSUB_NAME", "pubsub"),
-		completionTopic: getEnv("COMPLETION_TOPIC", "completed-events"),
-		daprBaseURL:     fmt.Sprintf("http://localhost:%s", getEnv("DAPR_HTTP_PORT", "3500")),
+		logger:             logger,
+		publishCh:          publishCh,
+		completionExchange: completionExchange,
 	}
 	app.healthy.Store(true)
 
-	logger.Info("application starting",
-		zap.String("pubsub_name", app.pubsubName),
-		zap.String("completion_topic", app.completionTopic),
-		zap.String("dapr_base_url", app.daprBaseURL),
-	)
-
-	r := chi.NewRouter()
-	r.Use(middleware.Recoverer)
-
-	r.Get("/healthz", app.healthHandler)
-	r.Post("/sqs-incoming", app.handleSQSBinding)
-
-	server := &http.Server{
-		Addr:    ":8080",
-		Handler: r,
+	// --- Start consuming ---
+	deliveries, err := consumeCh.Consume(incomingQueue, consumerTag, false, false, false, false, nil)
+	if err != nil {
+		logger.Fatal("failed to start consuming", zap.Error(err))
 	}
 
-	serverErr := make(chan error, 1)
+	var inflight sync.WaitGroup
+
 	go func() {
-		logger.Info("HTTP server listening", zap.String("addr", server.Addr))
+		for d := range deliveries {
+			inflight.Add(1)
+			app.processDelivery(d, &inflight)
+		}
+		logger.Info("delivery channel closed — consumer stopped")
+	}()
+
+	// --- HTTP server for /healthz ---
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", app.healthHandler)
+
+	server := &http.Server{Addr: ":8080", Handler: mux}
+	go func() {
+		logger.Info("HTTP server listening (healthz only)", zap.String("addr", server.Addr))
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			serverErr <- err
+			logger.Fatal("HTTP server error", zap.Error(err))
 		}
 	}()
 
+	// --- Wait for shutdown signal ---
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	sig := <-quit
 
-	select {
-	case err := <-serverErr:
-		logger.Fatal("server error", zap.Error(err))
-	case sig := <-quit:
-		logger.Info("shutdown signal received",
-			zap.String("signal", sig.String()),
-		)
+	logger.Info("shutdown signal received", zap.String("signal", sig.String()))
+
+	// Step 1: Cancel AMQP consumer. RabbitMQ stops delivering immediately.
+	// Queued messages stay visible for other consumers.
+	logger.Info("canceling AMQP consumer — no more deliveries after this")
+	if err := consumeCh.Cancel(consumerTag, false); err != nil {
+		logger.Error("failed to cancel consumer", zap.Error(err))
 	}
 
-	// Step 1: Mark unhealthy so Dapr's health probes detect the state change
-	// and stop routing new pub/sub events to this app.
+	// Step 2: Mark unhealthy for K8s readiness probes.
 	app.healthy.Store(false)
-	logger.Info("application marked unhealthy — Dapr will stop routing new events")
+	logger.Info("application marked unhealthy")
 
-	// Step 2: Wait for Dapr's health probes to pick up the unhealthy state.
-	// With probe interval=3s and threshold=2, allow 2 full probe cycles (~10s).
-	logger.Info("waiting for Dapr health probes to detect unhealthy state",
-		zap.Duration("wait", healthProbeWait),
-	)
-	time.Sleep(healthProbeWait)
+	// Step 3: Wait for in-flight message to finish + ACK.
+	logger.Info("waiting for in-flight message to drain")
+	inflight.Wait()
+	logger.Info("in-flight messages drained")
 
-	// Step 3: Stop accepting new HTTP connections; wait for in-flight handlers to finish.
-	// server.Shutdown blocks until all active connections (i.e. the in-progress event
-	// handler) have returned.
-	logger.Info("draining in-flight event handlers",
-		zap.Duration("timeout", serverShutdownTimeout),
-	)
+	// Step 4: Close AMQP.
+	publishCh.Close()
+	consumeCh.Close()
+	conn.Close()
+	logger.Info("AMQP connection closed")
+
+	// Step 5: Shutdown HTTP server.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), serverShutdownTimeout)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("HTTP server shutdown error", zap.Error(err))
 	}
 
-	logger.Info("all handlers drained — application exiting")
+	logger.Info("all resources released — application exiting")
 }
 
-func (a *App) healthHandler(w http.ResponseWriter, r *http.Request) {
-	if !a.healthy.Load() {
-		a.logger.Debug("health probe responded unhealthy")
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		fmt.Fprint(w, `{"status":"unhealthy"}`)
-		return
-	}
-	a.logger.Debug("health probe responded healthy")
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, `{"status":"healthy"}`)
-}
-
-func (a *App) handleSQSBinding(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		a.logger.Error("failed to read request body", zap.Error(err))
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
+func (a *App) processDelivery(d amqp.Delivery, wg *sync.WaitGroup) {
+	defer wg.Done()
 
 	var payload map[string]any
 	eventID := "unknown"
-	if err := json.Unmarshal(body, &payload); err == nil {
+	if err := json.Unmarshal(d.Body, &payload); err == nil {
 		if id, ok := payload["id"]; ok {
 			eventID = fmt.Sprintf("%v", id)
 		}
 	}
 
-	a.logger.Info("SQS binding event received — beginning processing",
+	a.logger.Info("event received — beginning processing",
 		zap.String("event_id", eventID),
-		zap.String("body", string(body)),
-		zap.String("remote_addr", r.RemoteAddr),
+		zap.String("body", string(d.Body)),
+		zap.Uint64("delivery_tag", d.DeliveryTag),
 	)
 
 	ticker := time.NewTicker(1 * time.Second)
@@ -168,38 +228,46 @@ func (a *App) handleSQSBinding(w http.ResponseWriter, r *http.Request) {
 		)
 	}
 
-	a.logger.Info("event processing complete — publishing completion event",
+	a.logger.Info("event processing complete — publishing completion",
 		zap.String("event_id", eventID),
-		zap.String("pubsub", a.pubsubName),
-		zap.String("topic", a.completionTopic),
+		zap.String("exchange", a.completionExchange),
 	)
 
-	if err := a.publishCompletion(r.Context()); err != nil {
-		a.logger.Error("publish failed — returning 500 (message stays in SQS)",
+	if err := a.publishCompletion(eventID); err != nil {
+		a.logger.Error("publish failed — NACKing message (will requeue)",
 			zap.Error(err),
 			zap.String("event_id", eventID),
-			zap.String("pubsub", a.pubsubName),
-			zap.String("topic", a.completionTopic),
 		)
-		w.WriteHeader(http.StatusInternalServerError)
+		if nackErr := d.Nack(false, true); nackErr != nil {
+			a.logger.Error("NACK failed", zap.Error(nackErr), zap.String("event_id", eventID))
+		}
 		return
 	}
 
-	a.logger.Info("completion event published successfully",
-		zap.String("event_id", eventID),
-		zap.String("pubsub", a.pubsubName),
-		zap.String("topic", a.completionTopic),
-	)
-
-	a.logger.Info("handler returning 200 — Dapr will delete message from SQS",
+	a.logger.Info("completion published — ACKing message",
 		zap.String("event_id", eventID),
 	)
-	w.WriteHeader(http.StatusOK)
+	if err := d.Ack(false); err != nil {
+		a.logger.Error("ACK failed", zap.Error(err), zap.String("event_id", eventID))
+	}
 }
 
-func (a *App) publishCompletion(ctx context.Context) error {
+func (a *App) healthHandler(w http.ResponseWriter, r *http.Request) {
+	if !a.healthy.Load() {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprint(w, `{"status":"unhealthy"}`)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, `{"status":"healthy"}`)
+}
+
+func (a *App) publishCompletion(eventID string) error {
 	payload := map[string]any{
 		"completedAt": time.Now().UTC().Format(time.RFC3339),
+		"eventId":     eventID,
 		"message":     "event processing completed successfully",
 	}
 
@@ -208,33 +276,12 @@ func (a *App) publishCompletion(ctx context.Context) error {
 		return fmt.Errorf("marshal payload: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/v1.0/publish/%s/%s", a.daprBaseURL, a.pubsubName, a.completionTopic)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	a.logger.Debug("publishing to Dapr HTTP API",
-		zap.String("url", url),
-		zap.ByteString("body", body),
-	)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("http post: %w", err)
-	}
-	defer resp.Body.Close()
-
-	a.logger.Debug("Dapr publish response",
-		zap.Int("status_code", resp.StatusCode),
-	)
-
-	// Dapr returns 204 No Content on successful publish
-	if resp.StatusCode != http.StatusNoContent {
-		return fmt.Errorf("unexpected Dapr response status: %d", resp.StatusCode)
-	}
-
-	return nil
+	return a.publishCh.PublishWithContext(ctx, a.completionExchange, "completion", false, false, amqp.Publishing{
+		ContentType:  "application/json",
+		DeliveryMode: amqp.Persistent,
+		Body:         body,
+	})
 }

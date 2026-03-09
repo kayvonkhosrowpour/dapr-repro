@@ -5,25 +5,11 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
-dapr:
-  appId: dapr-repro
-  appPort: "8080"
-  pubsubName: pubsub
-  completionTopic: completed-events
-  blockShutdownDuration: "60s"
-  gracefulShutdownSeconds: "90"
-
-aws:
-  queueName: pcsf-scan-dev
-  region: us-west-2
-  # Set these for minikube / non-IRSA environments.
-  # Leave empty when running on EKS with IRSA.
-  accessKey: ""
-  secretKey: ""
-  sessionToken: ""
-
 rabbit:
   host: rabbitmq.rabbit.svc.cluster.local
   port: "5672"
   username: rabbit
   password: rabbit
+  incomingExchange: incoming-events
+  incomingQueue: dapr-repro-incoming-events
+  completionExchange: completed-events
