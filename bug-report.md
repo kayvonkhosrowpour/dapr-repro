@@ -1,53 +1,102 @@
-# Pub/Sub: Messages NACKed to dead-letter queue during graceful shutdown due to premature subscription close
+# RabbitMQ: `handleMessage` NACKs messages on `context.Canceled` during graceful shutdown, routing them to the dead-letter queue
 
 ## In what area(s)?
 
-/area runtime
+/area pubsub
 
-## What version of Dapr?
+## What component?
 
-> 1.16.9
+`pubsub.rabbitmq`
+
+## What version of components-contrib / Dapr?
+
+- components-contrib: v1.16.10 (and current `main`)
+- Dapr runtime: v1.16.10 (also reproducible with dapr/dapr PR #9619 applied)
+
+## Related Issues
+
+- dapr/dapr#9604 — Pub/Sub: Messages NACKed to dead-letter queue during graceful shutdown due to premature subscription close
+- dapr/dapr#9619 — fix: Prevent pub/sub messages from being NACKed during graceful shutdown
 
 ## Expected Behavior
 
-When a pod receives SIGTERM and `block-shutdown-duration` is configured, queued pub/sub messages that have not yet been delivered to the application should either:
-
-1. Remain on the broker queue (requeued) so another consumer can pick them up, or
-2. Not be fetched from the broker at all once shutdown begins.
-
-Messages should never be routed to the dead-letter queue during a graceful shutdown when the application has done nothing wrong.
+When the Dapr runtime is shutting down and the subscription handler returns `context.Canceled` (because the subscription context was cancelled), the RabbitMQ component should **not** NACK the message. Instead, it should leave the message unacknowledged so that when the AMQP connection closes, RabbitMQ redelivers the message to another consumer.
 
 ## Actual Behavior
 
-Queued messages are NACKed **without requeue** during graceful shutdown, sending them to the dead-letter queue. This happens because of a race condition in the runtime's shutdown sequence:
+`handleMessage` in `pubsub/rabbitmq/rabbitmq.go` unconditionally NACKs any non-nil error returned by the handler — including `context.Canceled`. With `enableDeadLetter: true` and `requeueInFailure: false` (the default), this routes the message to the dead-letter queue.
 
-1. SIGTERM arrives. The runtime calls `StopAllSubscriptionsForever()` **immediately**, setting `subscription.closed = true` — before the `block-shutdown-duration` wait.
-2. The currently in-flight event drains correctly (protected by `wg.Wait()`).
-3. When the in-flight event's ACK frees the `prefetchCount=1` slot, the broker delivers the next queued message(s). But the subscription handler sees `s.closed == true` and instantly returns `errors.New("subscription is closed")`.
-4. The RabbitMQ component's `handleMessage` calls `d.Nack(false, false)` (no requeue). With `enableDeadLetter: true`, the NACKed messages route to the DLX/DLQ.
-5. The subscription context is only canceled ~400ms later (after `Stop()` finishes), which is when the consumer channel actually closes. During that window, multiple messages are delivered and NACKed.
+This means that even after dapr/dapr#9619 fixes the runtime to block on `ctx.Done()` instead of returning `"subscription is closed"`, one message still gets NACKed to the DLQ during the narrow window when the context is cancelled and the AMQP connection hasn't yet closed.
 
-Relevant error from daprd logs:
+### Relevant log from daprd
 
 ```
-level=error msg="rabbitmq pub/sub error: handling message from topic 'incoming-events', subscription is closed"
+level=error msg="rabbitmq pub/sub error: handling message from topic 'incoming-events', context canceled"
 ```
 
-**Key insight:** `block-shutdown-duration` keeps the Dapr HTTP/gRPC API alive so the app can still publish, but it does **not** keep subscriptions alive. Subscriptions are stopped immediately on SIGTERM regardless of `block-shutdown-duration`.
+Note: the error is `context canceled` (not `subscription is closed`), confirming the runtime fix from #9619 is working. But `handleMessage` still NACKs it.
 
-**Relevant source locations:**
-- `pkg/runtime/runtime.go` ~L467-481: `StopAllSubscriptionsForever` called before the block-shutdown select
-- `pkg/runtime/subscription/subscription.go` ~L145-146: `s.closed` check returns error
-- `pkg/runtime/subscription/subscription.go` ~L382-404: `Stop()` with ~400ms window before context cancelation
+## Root Cause
 
-## Steps to Reproduce the Problem
+In [`pubsub/rabbitmq/rabbitmq.go` — `handleMessage`](https://github.com/dapr/components-contrib/blob/main/pubsub/rabbitmq/rabbitmq.go#L624-L656):
 
-Full reproduction repo with one-command setup: https://github.com/kayvonkhosrowpour/dapr-repro
+```go
+func (r *rabbitMQ) handleMessage(ctx context.Context, d amqp.Delivery, topic string, handler pubsub.Handler) error {
+    // ...
+    err := handler(ctx, pubsubMsg)
 
-**Setup:** A Go app subscribes to a RabbitMQ topic via Dapr declarative subscription. Each event takes ~20s to process. The Dapr sidecar is configured with `block-shutdown-duration: 60s`, app health checks (interval 3s, threshold 2), `prefetchCount: 1`, and `enableDeadLetter: true`.
+    if err != nil {
+        r.logger.Errorf("%s handling message from topic '%s', %s", errorMessagePrefix, topic, err)
+
+        if !r.metadata.AutoAck {
+            r.logger.Debugf("%s nacking message '%s' from topic '%s', requeue=%t", logMessagePrefix, d.MessageId, topic, r.metadata.RequeueInFailure)
+            if err = d.Nack(false, r.metadata.RequeueInFailure); err != nil {
+                r.logger.Errorf("%s error nacking message '%s' from topic '%s', %s", logMessagePrefix, d.MessageId, topic, err)
+            }
+        }
+    } else if !r.metadata.AutoAck {
+        // ...ack...
+    }
+    return err
+}
+```
+
+The `if err != nil` block has no check for context cancellation. When `handler` returns `context.Canceled` during shutdown, the message is NACKed with `requeue=false`, sending it to the dead-letter queue.
+
+## Proposed Fix
+
+Add a `ctx.Err()` guard before the NACK logic. If the context is done, skip both ACK and NACK — the message stays unacknowledged, and RabbitMQ will redeliver it to another consumer when the connection closes:
+
+```go
+err := handler(ctx, pubsubMsg)
+
+if err != nil {
+    if ctx.Err() != nil {
+        r.logger.Debugf("%s context done while handling message from topic '%s'; skipping ack/nack to allow redelivery", logMessagePrefix, topic)
+        return err
+    }
+
+    r.logger.Errorf("%s handling message from topic '%s', %s", errorMessagePrefix, topic, err)
+
+    if !r.metadata.AutoAck {
+        r.logger.Debugf("%s nacking message '%s' from topic '%s', requeue=%t", logMessagePrefix, d.MessageId, topic, r.metadata.RequeueInFailure)
+        if err = d.Nack(false, r.metadata.RequeueInFailure); err != nil {
+            r.logger.Errorf("%s error nacking message '%s' from topic '%s', %s", logMessagePrefix, d.MessageId, topic, err)
+        }
+    }
+} else if !r.metadata.AutoAck {
+    // ...ack unchanged...
+}
+```
+
+## Steps to Reproduce
+
+Full reproduction repo: https://github.com/kayvonkhosrowpour/dapr-repro (branch `components-contrib-bug`)
+
+**Setup:** A Go app subscribes to a RabbitMQ topic via Dapr programmatic subscription. Each event takes ~20s to process. The Dapr sidecar is configured with `block-shutdown-duration: 60s`, app health checks (interval 3s, threshold 2), `prefetchCount: 1`, and `enableDeadLetter: true`.
 
 ```bash
-# 1. Start minikube and deploy everything (Dapr 1.16.9, RabbitMQ, demo app)
+# 1. Start minikube and deploy everything
 minikube start --kubernetes-version=v1.33.0
 skaffold run
 
@@ -62,12 +111,17 @@ for i in $(seq 1 8); do
     http://localhost:3500/v1.0/publish/pubsub/incoming-events
 done
 
-# 4. Wait for tick logs to appear, then kill the pod
+# 4. Wait for processing tick logs to appear, then delete the pod
 kubectl delete pod -n dapr-repro -l app=dapr-repro
 ```
 
-**Observe:** The in-flight event drains correctly, but immediately after, multiple `"subscription is closed"` errors appear and those messages land in the `dlq-dapr-repro-incoming-events` queue (visible in the RabbitMQ management UI at `localhost:15672`, credentials `rabbit`/`rabbit`).
+**Observe:**
+- With standard Dapr (pre-#9619): multiple messages NACKed with `"subscription is closed"` errors → multiple DLQ messages.
+- With Dapr including #9619 fix: one message NACKed with `"context canceled"` → one DLQ message. This is the components-contrib gap.
+- With the proposed `ctx.Err()` fix in `handleMessage`: zero DLQ messages.
+
+Check the RabbitMQ management UI at `localhost:15672` (credentials `rabbit`/`rabbit`) to see DLQ queue counts.
 
 ## Release Note
 
-RELEASE NOTE: **FIX** Pub/sub subscriptions are now stopped after `block-shutdown-duration` expires instead of immediately on SIGTERM, preventing queued messages from being incorrectly NACKed to the dead-letter queue during graceful shutdown.
+RELEASE NOTE: **FIX** RabbitMQ pub/sub `handleMessage` now skips NACK when the context is cancelled (e.g. during graceful shutdown), leaving the message unacknowledged for redelivery by the broker instead of routing it to the dead-letter queue.

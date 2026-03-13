@@ -1,0 +1,21 @@
+apiVersion: dapr.io/v1alpha1
+kind: Component
+metadata:
+  name: pubsub
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: pubsub.rabbitmq
+  version: v1
+  metadata:
+    - name: connectionString
+      value: "amqp://{{ .Values.rabbit.username }}:{{ .Values.rabbit.password }}@{{ .Values.rabbit.host }}:{{ .Values.rabbit.port }}"
+    - name: enableDeadLetter
+      value: "true"
+    - name: prefetchCount
+      value: "1"
+    - name: durable
+      value: "true"
+    - name: deleteWhenUnused
+      value: "false"
+scopes:
+  - dapr-repro

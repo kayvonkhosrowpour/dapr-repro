@@ -13,6 +13,15 @@ spec:
     metadata:
       labels:
         app: dapr-repro
+      annotations:
+        dapr.io/enabled: "true"
+        dapr.io/app-id: "dapr-repro"
+        dapr.io/app-port: "8080"
+        dapr.io/enable-app-health-check: "true"
+        dapr.io/app-health-check-path: "/healthz"
+        dapr.io/app-health-probe-interval: "3"
+        dapr.io/app-health-probe-threshold: "2"
+        dapr.io/block-shutdown-duration: "60s"
     spec:
       terminationGracePeriodSeconds: 120
       containers:
@@ -23,15 +32,6 @@ spec:
             - name: http
               containerPort: 8080
               protocol: TCP
-          env:
-            - name: RABBITMQ_URL
-              value: "amqp://{{ .Values.rabbit.username }}:{{ .Values.rabbit.password }}@{{ .Values.rabbit.host }}:{{ .Values.rabbit.port }}"
-            - name: INCOMING_EXCHANGE
-              value: {{ .Values.rabbit.incomingExchange | quote }}
-            - name: INCOMING_QUEUE
-              value: {{ .Values.rabbit.incomingQueue | quote }}
-            - name: COMPLETION_EXCHANGE
-              value: {{ .Values.rabbit.completionExchange | quote }}
           readinessProbe:
             httpGet:
               path: /healthz

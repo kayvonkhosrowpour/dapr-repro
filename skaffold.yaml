@@ -16,6 +16,13 @@ deploy:
   kubeContext: minikube
   helm:
     releases:
+      - name: dapr
+        repo: https://dapr.github.io/helm-charts/
+        remoteChart: dapr
+        namespace: dapr-system
+        createNamespace: true
+        wait: true
+
       - name: rabbitmq
         remoteChart: oci://registry-1.docker.io/bitnamicharts/rabbitmq
         namespace: &rabbit-namespace rabbit
