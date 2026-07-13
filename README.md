@@ -1,10 +1,19 @@
 # Dapr RabbitMQ Pub/Sub — DLQ During Graceful Shutdown Reproduction
 
-Minimal reproduction demonstrating that the Dapr RabbitMQ pub/sub component's `handleMessage` NACKs messages to the dead-letter queue when the handler returns `context.Canceled` during graceful shutdown.
+Minimal reproduction demonstrating that the Dapr RabbitMQ pub/sub component's `handleMessage`
+NACKs messages to the dead-letter queue when the handler returns `context.Canceled` during
+graceful shutdown.
+
+**Status as of Dapr v1.18.1 / components-contrib v1.18.1 (latest):** The bug is **still present**.
+The runtime-level fix landed in dapr v1.14+ (dapr/dapr#9619), changing the error from
+`"subscription is closed"` → `"context canceled"`. But `handleMessage` in the RabbitMQ component
+still NACKs on any non-nil error, including `context.Canceled`. This repo demonstrates the
+remaining components-contrib gap.
 
 Related issues:
-- [dapr/dapr#9604](https://github.com/dapr/dapr/issues/9604) — Runtime-side fix (PR #9619)
-- [dapr/components-contrib bug report](bug-report.md) — The components-contrib gap this repo demonstrates
+- [dapr/dapr#9604](https://github.com/dapr/dapr/issues/9604) — Original runtime-side bug report
+- [dapr/dapr#9619](https://github.com/dapr/dapr/pull/9619) — Runtime fix (merged)
+- [dapr/components-contrib#4281](https://github.com/dapr/components-contrib/issues/4281) — Component-level bug report (filed Mar 2026, closed as stale — unfixed)
 
 ## Prerequisites
 
@@ -21,7 +30,7 @@ skaffold run
 ```
 
 This deploys:
-- Dapr (from the official Helm chart)
+- Dapr **v1.18.1** (from the official Helm chart, pinned in `skaffold.yaml`)
 - RabbitMQ (Bitnami, management UI on port 15672)
 - A demo Go app subscribed to `incoming-events` via Dapr pub/sub
 
@@ -54,19 +63,30 @@ kubectl delete pod -n dapr-repro -l app=dapr-repro
 
 | Scenario | Messages to DLQ | Error in daprd logs |
 |----------|----------------|---------------------|
-| Standard Dapr (pre-#9619) | Multiple | `"subscription is closed"` |
-| Dapr with #9619 fix | **1** | `"context canceled"` |
-| Dapr with #9619 + components-contrib fix | **0** | None |
+| Standard Dapr (pre-#9619, v1.16.x) | Multiple | `"subscription is closed"` |
+| Dapr v1.18.1 (runtime fix only) | **1** | `"context canceled"` |
+| Dapr v1.18.1 + components-contrib fix | **0** | None |
 
-Check the RabbitMQ management UI at http://localhost:15672 (credentials: `rabbit`/`rabbit`). Look at the `dlq-dapr-repro-incoming-events` queue for messages that were incorrectly NACKed during shutdown.
+Check the RabbitMQ management UI at http://localhost:15672 (credentials: `rabbit`/`rabbit`).
+Look at the `dlq-dapr-repro-incoming-events` queue for messages that were incorrectly NACKed
+during shutdown.
+
+**With Dapr v1.18.1 you will observe exactly 1 message in the DLQ** — the one being processed
+when the pod was deleted. The daprd log will show:
+
+```
+level=error msg="rabbitmq pub/sub error: handling message from topic 'incoming-events', context canceled"
+```
 
 ## Root Cause
 
-`handleMessage` in `pubsub/rabbitmq/rabbitmq.go` unconditionally NACKs any non-nil error from the handler, including `context.Canceled`. During graceful shutdown, the runtime's subscription handler (with #9619 applied) blocks on `ctx.Done()` then returns `ctx.Err()` — this flows back as `context.Canceled` and triggers the NACK.
+`handleMessage` in `pubsub/rabbitmq/rabbitmq.go` unconditionally NACKs any non-nil error from
+the handler, including `context.Canceled`. During graceful shutdown, the runtime (v1.18.1)
+blocks on `ctx.Done()` then returns `ctx.Err()` — this flows back as `context.Canceled` and
+triggers the NACK.
 
-## Proposed Fix
-
-See [bug-report.md](bug-report.md) for the full analysis and proposed code change.
+The fix is a 5-line guard in `handleMessage`. See [bug-report.md](bug-report.md) for full
+analysis and the proposed code change.
 
 ## Cleanup
 
